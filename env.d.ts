@@ -34,6 +34,7 @@ interface Env {
   MAIL_LOCALPART_MAX_LEN?: string;
   EMAIL_RETENTION_DAYS?: string;
   MAX_EMAIL_SIZE?: string;
+  ARCHIVE_FORWARD_TO?: string;
   
   // 缓存系统类型
   CACHE: {

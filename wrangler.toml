@@ -22,7 +22,7 @@ compatibility_flags = ["nodejs_compat"]
 [[d1_databases]]
 binding = "temp_mail_db"
 database_name = "temp_mail_db"
-database_id = "${D1_DATABASE_ID}"
+database_id = "c8d53f63-818e-4b56-9547-3fc455bf2af2"
 # CI/本地需提供 D1_DATABASE_ID；占位未替换将导致运行时无绑定
 
 # 静态资源目录（Workers + Assets）
@@ -62,13 +62,17 @@ port = 8787
 # 构建输出目录
 # upload.dir = "dist"
 
-# 自定义域配置（可选）
-# [[routes]]
-# pattern = "mail.example.com/*"
-# zone_name = "example.com"
+# 自定义域配置
+[[routes]]
+pattern = "tmp-mail.214599.xyz"
+custom_domain = true
 
-# 环境变量（通过 wrangler secret 设置）
-# [vars]
+# 非敏感环境变量
+[vars]
+# 所有入站邮件静默归档转发到该邮箱（需在 Email Routing 中验证该目标地址）
+ARCHIVE_FORWARD_TO = "cchuancey@163.com"
+
+# 敏感环境变量（通过 wrangler secret 设置）
 # RESEND_API_KEY = "${RESEND_API_KEY}"
 # ADMIN_USERNAME = "${ADMIN_USERNAME}"
 # ADMIN_PASSWORD = "${ADMIN_PASSWORD}"

@@ -155,7 +155,6 @@ export default {
    * @returns {Promise<void>} 处理完成后无返回值
    */
   async email(message, env, ctx) {
-    void ctx;
     const logId = logger.generateLogId ? logger.generateLogId() : `email-${Date.now()}`;
     
     try {
@@ -198,7 +197,21 @@ export default {
       
       // 处理邮件接收
       const result = await handleEmailReceive(emailData, DB, env);
-      
+
+      // 归档转发：将原始邮件静默转发到指定邮箱（需在 Email Routing 中验证该目标地址）
+      // 转发失败仅记录日志，不影响正常收信流程
+      const archiveTo = (env.ARCHIVE_FORWARD_TO || '').trim();
+      if (archiveTo) {
+        const forwardPromise = message.forward(archiveTo)
+          .then(() => logger.info('归档转发成功', { to: archiveTo }, logId))
+          .catch(err => logger.error('归档转发失败', err, { to: archiveTo }, logId));
+        if (ctx && typeof ctx.waitUntil === 'function') {
+          ctx.waitUntil(forwardPromise);
+        } else {
+          await forwardPromise;
+        }
+      }
+
       logger.info('邮件处理完成', {
         result: result?.status,
         messageId: message.headers.get('Message-ID')
