@@ -40,6 +40,10 @@ function warn(message) {
 }
 
 function updateWranglerConfig(databaseId) {
+  if (!databaseId || databaseId === 'undefined') {
+    warn('未获取到有效的数据库ID，跳过 wrangler.toml 更新');
+    return;
+  }
   try {
     const wranglerContent = fs.readFileSync('wrangler.toml', 'utf8');
     let updatedContent = wranglerContent;
@@ -114,38 +118,43 @@ async function main() {
         error('数据库创建后未找到，请手动检查');
       }
       
-      // 初始化数据库表结构
+      // 初始化数据库表结构（--remote 操作远端；d1 execute 使用数据库名而非 ID）
       info('初始化数据库表结构...');
-      execSync(`npx wrangler d1 execute ${newDb.id} --file=./d1-init.sql`, { stdio: 'inherit' });
+      execSync(`npx wrangler d1 execute temp_mail_db --remote --file=./d1-init.sql`, { stdio: 'inherit' });
       success('数据库表结构初始化完成');
-      
+
+      // wrangler v4 d1 list --json 返回的 ID 字段为 uuid
+      const newDbId = newDb.uuid || newDb.id;
+
       // 更新 wrangler.toml
-      updateWranglerConfig(newDb.id);
-      
+      updateWranglerConfig(newDbId);
+
       // 设置环境变量
-      process.env.D1_DATABASE_ID = newDb.id;
+      process.env.D1_DATABASE_ID = newDbId;
       
     } catch (e) {
       error('数据库创建或初始化失败');
     }
   } else {
-    success(`找到数据库: ${targetDb.name} (ID: ${targetDb.id})`);
-    
+    // wrangler v4 d1 list --json 返回的 ID 字段为 uuid
+    const targetDbId = targetDb.uuid || targetDb.id;
+    success(`找到数据库: ${targetDb.name} (ID: ${targetDbId})`);
+
     // 更新 wrangler.toml
-    updateWranglerConfig(targetDb.id);
-    
+    updateWranglerConfig(targetDbId);
+
     // 设置环境变量
-    process.env.D1_DATABASE_ID = targetDb.id;
-    
-    // 检查数据库表结构
+    process.env.D1_DATABASE_ID = targetDbId;
+
+    // 检查数据库表结构（--remote 检查远端；d1 execute 使用数据库名而非 ID）
     info('检查数据库表结构...');
     try {
-      execSync(`npx wrangler d1 execute ${targetDb.id} --command="SELECT COUNT(*) FROM sqlite_master WHERE type='table';"`, { stdio: 'ignore' });
+      execSync(`npx wrangler d1 execute temp_mail_db --remote --command="SELECT COUNT(*) FROM sqlite_master WHERE type='table';"`, { stdio: 'ignore' });
       success('数据库表结构正常');
     } catch (e) {
       warn('数据库表结构可能不完整，尝试重新初始化...');
       try {
-        execSync(`npx wrangler d1 execute ${targetDb.id} --file=./d1-init.sql`, { stdio: 'inherit' });
+        execSync(`npx wrangler d1 execute temp_mail_db --remote --file=./d1-init.sql`, { stdio: 'inherit' });
         success('数据库表结构重新初始化完成');
       } catch (initError) {
         error('数据库表结构初始化失败');
@@ -172,7 +181,7 @@ async function main() {
   // 部署后验证
   info('验证部署结果...');
   try {
-    execSync('npx wrangler d1 execute temp_mail_db --command="PRAGMA table_info(messages);"', { stdio: 'ignore' });
+    execSync('npx wrangler d1 execute temp_mail_db --remote --command="PRAGMA table_info(messages);"', { stdio: 'ignore' });
     success('数据库连接验证成功');
   } catch (e) {
     warn('数据库连接验证失败，但部署可能仍然成功');

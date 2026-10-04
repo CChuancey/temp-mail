@@ -25,10 +25,20 @@ async function preDeployCheck() {
         
         // 2. 检查表结构
         console.log('🗃️  检查数据库表结构...');
-        const tableCheck = execSync('npx wrangler d1 execute temp_mail_db --command="SELECT name FROM sqlite_master WHERE type=\"table\";"', { encoding: 'utf8' });
-        
+        // 注意 1：SQL 字符串字面量用单引号，避免与外层 cmd 双引号在 Windows 上冲突
+        // 注意 2：必须加 --remote 检查远端数据库，否则查到的是空的本地 D1
+        const tableCheck = execSync(`npx wrangler d1 execute temp_mail_db --remote --json --command="SELECT name FROM sqlite_master WHERE type='table';"`, { encoding: 'utf8' });
+
         const requiredTables = ['mailboxes', 'messages', 'domains'];
-        const existingTables = tableCheck.match(/\| ([a-z_]+) \|/g)?.map(t => t.replace(/\| ([a-z_]+) \|/, '$1')) || [];
+        // wrangler v4 --json 输出格式：[{ results: [{name: '...'}, ...], ... }]
+        let existingTables = [];
+        try {
+          const parsed = JSON.parse(tableCheck);
+          existingTables = (parsed[0]?.results || []).map(r => r.name);
+        } catch (_) {
+          // 兼容旧版 ASCII 表格输出
+          existingTables = tableCheck.match(/\| ([a-z_]+) \|/g)?.map(t => t.replace(/\| ([a-z_]+) \|/, '$1')) || [];
+        }
         
         const missingTables = requiredTables.filter(table => !existingTables.includes(table));
         
