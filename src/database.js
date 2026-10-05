@@ -885,3 +885,45 @@ export async function cleanupOldMessages(db, days = 60, force = false) {
   }
   return totalDeleted;
 }
+
+/**
+ * 读取应用配置项（如归档转发邮箱）
+ * @param {object} db - D1 连接
+ * @param {string} key - 配置键
+ * @returns {Promise<string|null>} 配置值，未设置返回 null
+ */
+export async function getAppConfig(db, key) {
+  if (!db || !key) { return null; }
+  try {
+    const { results } = await db.prepare('SELECT value FROM app_config WHERE key = ?').bind(key).all();
+    const v = results && results.length ? results[0].value : null;
+    return (v === null || v === undefined || String(v).trim() === '') ? null : String(v).trim();
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * 写入应用配置项（upsert）。值为空表示清除。
+ * @param {object} db - D1 连接
+ * @param {string} key - 配置键
+ * @param {string} value - 配置值
+ * @returns {Promise<boolean>} 是否成功
+ */
+export async function setAppConfig(db, key, value) {
+  if (!db || !key) { return false; }
+  try {
+    const v = (value === null || value === undefined) ? '' : String(value).trim();
+    if (v === '') {
+      await db.prepare('DELETE FROM app_config WHERE key = ?').bind(key).run();
+    } else {
+      await db.prepare(
+        'INSERT INTO app_config (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) ' +
+        'ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP'
+      ).bind(key, v).run();
+    }
+    return true;
+  } catch (e) {
+    return false;
+  }
+}

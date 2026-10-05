@@ -76,6 +76,13 @@ CREATE TABLE IF NOT EXISTS user_mailboxes (
   FOREIGN KEY(mailbox_id) REFERENCES mailboxes(id) ON DELETE CASCADE
 );
 
+-- 应用配置表（键值对，如归档转发邮箱 ARCHIVE_FORWARD_TO）
+CREATE TABLE IF NOT EXISTS app_config (
+  key TEXT PRIMARY KEY,
+  value TEXT,
+  updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
 -- 发送邮件记录表
 CREATE TABLE IF NOT EXISTS sent_emails (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
