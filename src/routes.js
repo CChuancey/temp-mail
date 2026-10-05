@@ -310,12 +310,13 @@ export function createRouter() {
     try {
       DB = await getDatabaseWithValidation(env);
     } catch (error) {
-      logger.error('登录时数据库连接失败', { logId, action: 'login', error: error.message });
+      logger.error('登录时数据库连接失败', error, { logId, action: 'login' });
       return new Response('数据库连接失败', { status: 500 });
     }
     const ADMIN_NAME = String(env.ADMIN_NAME || 'admin').trim().toLowerCase();
-    const ADMIN_PASSWORD = env.ADMIN_PASSWORD || env.ADMIN_PASS || '';
-    const GUEST_PASSWORD = env.GUEST_PASSWORD || '';
+    // 去除首尾空白：避免配置中的换行/空格导致密码比对失败
+    const ADMIN_PASSWORD = String(env.ADMIN_PASSWORD || env.ADMIN_PASS || '').trim();
+    const GUEST_PASSWORD = String(env.GUEST_PASSWORD || '').trim();
     const JWT_TOKEN = env.JWT_TOKEN || env.JWT_SECRET || '';
 
     try {
@@ -336,14 +337,16 @@ export function createRouter() {
         
         let adminUserId = 0;
         try {
-          const u = await DB.prepare('SELECT id FROM users WHERE username = ?').bind(ADMIN_NAME).all();
-          if (u?.results?.length) {
-            adminUserId = Number(u.results[0].id);
-          } else {
-            await DB.prepare('INSERT INTO users (username, role, can_send, mailbox_limit) VALUES (?, \'admin\', 1, 9999)').bind(ADMIN_NAME).run();
-            const again = await DB.prepare('SELECT id FROM users WHERE username = ?').bind(ADMIN_NAME).all();
-            adminUserId = Number(again?.results?.[0]?.id || 0);
-          }
+          // 用 upsert 确保管理员账号存在，并同步写入 ADMIN_PASSWORD 的 SHA-256 哈希。
+          // 自愈机制：即使后续 ADMIN_PASSWORD 环境变量被误刷丢失，
+          // 仍可凭下方「普通用户」分支通过数据库哈希回退登录。
+          const adminHash = await sha256Hex(ADMIN_PASSWORD);
+          await DB.prepare(
+            'INSERT INTO users (username, role, password_hash, can_send, mailbox_limit) VALUES (?, \'admin\', ?, 1, 9999) ' +
+            'ON CONFLICT(username) DO UPDATE SET role=\'admin\', password_hash=excluded.password_hash, can_send=1, mailbox_limit=9999'
+          ).bind(ADMIN_NAME, adminHash).run();
+          const again = await DB.prepare('SELECT id FROM users WHERE username = ?').bind(ADMIN_NAME).all();
+          adminUserId = Number(again?.results?.[0]?.id || 0);
         } catch (err) {
           void err;
           adminUserId = 0;
@@ -394,7 +397,7 @@ export function createRouter() {
           logger.warn('普通用户不存在', { logId, action: 'login', username: name, status: 401 });
         }
       } catch (error) {
-        logger.error('普通用户登录查询异常', { logId, action: 'login', username: name, error: error.message });
+        logger.error('普通用户登录查询异常', error, { logId, action: 'login', username: name });
         // ignore and fallback to mailbox login
       }
 
@@ -433,14 +436,14 @@ export function createRouter() {
           logger.warn('邮箱格式无效', { logId, action: 'login', username: name, status: 401 });
         }
       } catch (error) {
-        logger.error('邮箱登录异常', { logId, action: 'login', username: name, error: error.message });
+        logger.error('邮箱登录异常', error, { logId, action: 'login', username: name });
         // ignore and fallback unauthorized
       }
 
       logger.warn('所有登录方式均失败', { logId, action: 'login', username: name, status: 401 });
       return new Response('用户名或密码错误', { status: 401 });
     } catch (error) {
-      logger.error('登录请求处理异常', { logId, action: 'login', error: error.message, status: 400 });
+      logger.error('登录请求处理异常', error, { logId, action: 'login', status: 400 });
       return new Response('Bad Request', { status: 400 });
     }
   });
@@ -468,10 +471,9 @@ export function createRouter() {
   });
 
   router.get('/api/session', async(context) => {
-    const { env, authPayload } = context;
+    const { authPayload } = context;
     const logId = `session-${Date.now()}`;
-    const ADMIN_NAME = String(env.ADMIN_NAME || 'admin').trim().toLowerCase();
-    
+
     logger.info('会话状态查询开始', { logId, action: 'session_check', username: authPayload?.username, role: authPayload?.role });
     
     if (!authPayload) {
@@ -479,10 +481,7 @@ export function createRouter() {
       return new Response('Unauthorized', { status: 401 });
     }
     
-    const strictAdmin = (authPayload.role === 'admin') && (
-      String(authPayload.username || '').trim().toLowerCase() === ADMIN_NAME || 
-      String(authPayload.username || '') === '__root__'
-    );
+    const strictAdmin = (authPayload.role === 'admin');
     
     logger.info('会话状态查询成功', { logId, action: 'session_check', username: authPayload.username, role: authPayload.role, strictAdmin });
     
