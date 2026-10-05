@@ -227,10 +227,11 @@
       </div>
       <div class="modal-body">
         <div class="compose-form">
-          <div class="field-group">
+          <div class="field-group field-group-pos">
             <label class="field-label">收件人</label>
-            <input id="compose-to" class="input field-input" type="text" placeholder="foo@example.com, bar@example.com" />
-            <div class="field-hint">多个地址请以逗号分隔</div>
+            <input id="compose-to" class="input field-input" type="text" placeholder="foo@example.com, bar@example.com" autocomplete="off" />
+            <div id="compose-addr-suggest" class="addr-suggest" hidden></div>
+            <div class="field-hint">多个地址请以逗号分隔；输入时会从历史收发人自动补全。也可双击输入框直接浏览最近的联系人。</div>
           </div>
           <div class="field-group">
             <label class="field-label">发件名称（可选）</label>
@@ -241,8 +242,20 @@
             <input id="compose-subject" class="input field-input" type="text" placeholder="主题" />
           </div>
           <div class="field-group">
-            <label class="field-label">内容</label>
-            <textarea id="compose-body" class="textarea field-textarea" rows="10" placeholder="请输入邮件内容"></textarea>
+            <label class="field-label">内容 <span class="field-hint">（支持富文本）</span></label>
+            <div class="compose-editor-toolbar" role="toolbar" aria-label="富文本工具">
+              <button type="button" class="ce-tool" data-cmd="bold" title="加粗"><span style="font-weight:700">B</span></button>
+              <button type="button" class="ce-tool" data-cmd="italic" title="斜体"><i>I</i></button>
+              <button type="button" class="ce-tool" data-cmd="underline" title="下划线"><u>U</u></button>
+              <button type="button" class="ce-tool" data-cmd="strikeThrough" title="删除线"><s>S</s></button>
+              <span class="ce-sep"></span>
+              <button type="button" class="ce-tool" data-cmd="insertUnorderedList" title="无序列表">•≡</button>
+              <button type="button" class="ce-tool" data-cmd="insertOrderedList" title="有序列表">1≡</button>
+              <span class="ce-sep"></span>
+              <button type="button" class="ce-tool" data-cmd="createLink" title="插入链接">🔗</button>
+              <button type="button" class="ce-tool" data-cmd="insertImage" title="插入图片">🖼</button>
+            </div>
+            <div id="compose-body" class="textarea field-textarea compose-editor" contenteditable="true" data-placeholder="请输入邮件内容（支持加粗、列表、图片、链接等富文本）" role="textbox" aria-multiline="true"></div>
           </div>
           <div class="compose-actions">
             <button id="compose-cancel" class="btn btn-secondary">取消</button>

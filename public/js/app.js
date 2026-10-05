@@ -17,6 +17,8 @@ async function api(path, options){
 
 function escapeAttr(s){ return String(s||'').replace(/&/g,'&amp;').replace(/'/g,'&#39;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
+function escapeHtml(s){ return String(s||'').replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c] || c)); }
+
 // 将 D1 返回的 UTC 时间（YYYY-MM-DD HH:MM:SS）格式化为东八区显示
 function formatTs(ts){
   if (!ts || typeof ts !== 'string') return '';
@@ -1423,7 +1425,9 @@ function openCompose(){
   if (!els.composeModal) return;
   els.composeTo.value = '';
   els.composeSubject.value = '';
-  els.composeHtml.value = '';
+  els.composeHtml.innerHTML = '';
+  const as = document.getElementById('compose-addr-suggest');
+  if (as) { as.setAttribute('hidden', ''); }
   els.composeModal.classList.add('show');
 }
 
@@ -1431,20 +1435,45 @@ function closeCompose(){
   els.composeModal?.classList.remove('show');
 }
 
+// 将富文本里的 base64 data URI 图片转成 cid: 引用 + 附件（Gmail/Outlook 不显示 data: URI，必须用内嵌附件的方式才能跨端显示）
+function extractEmailImages(html){
+  const attachments = [];
+  const extByMime = { 'image/png':'png','image/jpeg':'jpg','image/gif':'gif','image/webp':'webp','image/svg+xml':'svg','image/bmp':'bmp' };
+  const out = String(html || '').replace(/<img([^>]*)>/gi, function(m, attrs){
+    const srcM = /src=["']([^"']*)["']/i.exec(attrs || '');
+    if (!srcM) return m;
+    const src = srcM[1];
+    const mimeM = /^data:(image\/[^;]+);base64,/.exec(src);
+    if (!mimeM) return m; // 外链图片保持原样
+    const mime = mimeM[1].toLowerCase();
+    const b64 = src.slice(src.indexOf('base64,') + 7);
+    const idx = attachments.length + 1;
+    const cid = 'img-' + idx;
+    const ext = extByMime[mime] || 'png';
+    attachments.push({ filename: 'image-' + idx + '.' + ext, content: b64, content_id: cid, disposition: 'inline' });
+    // 用 cid 引用替换 data URI，并移除原 src 属性避免残留长串
+    return '<img src="cid:' + cid + '"' + attrs.replace(/src=["'][^"']*["']/i, '') + '>';
+  });
+  return { html: out, attachments };
+}
+
 async function sendCompose(){
   try{
     setButtonLoading(els.composeSend, '正在发送…');
     if (!window.currentMailbox){ showToast('请先选择或生成邮箱', 'warn'); return; }
+    const rawHtml = (els.composeHtml.innerHTML || '').trim();
+    const converted = extractEmailImages(rawHtml);
     const payload = {
       from: window.currentMailbox,
       to: (els.composeTo.value||'').split(',').map(s=>s.trim()).filter(Boolean),
       subject: (els.composeSubject.value||'').trim(),
-      html: els.composeHtml.value || '',
+      html: converted.html,
       fromName: (els.composeFromName?.value || '').trim()
     };
+    if (converted.attachments.length) { payload.attachments = converted.attachments; }
     if (!payload.to.length){ showToast('请输入收件人', 'warn'); return; }
     // 主题可为空
-    if (!payload.html){ showToast('请输入 HTML 内容', 'warn'); return; }
+    if (!payload.html){ showToast('请输入邮件内容', 'warn'); return; }
     // 自动生成 text 版本，增强兼容性
     try{
       const text = payload.html.replace(/<[^>]+>/g, ' ').replace(/\s+/g,' ').trim();
@@ -1467,6 +1496,47 @@ if (els.composeClose){ els.composeClose.onclick = closeCompose; }
 if (els.composeCancel){ els.composeCancel.onclick = closeCompose; }
 if (els.composeSend){ els.composeSend.onclick = sendCompose; }
 
+// 富文本编辑工具栏
+function initComposeEditor(){
+  const ed = document.getElementById('compose-body');
+  if (!ed) return;
+  const group = ed.closest('.field-group');
+  const toolbar = group ? group.querySelector('.compose-editor-toolbar') : null;
+  if (!toolbar) return;
+  // 保持编辑器获得焦点，避免按钮抢焦点
+  toolbar.addEventListener('mousedown', (ev) => ev.preventDefault());
+  toolbar.addEventListener('click', (ev) => {
+    const btn = ev.target.closest && ev.target.closest('[data-cmd]');
+    if (!btn) return;
+    const cmd = btn.getAttribute('data-cmd');
+    if (cmd === 'createLink') {
+      const sel = window.getSelection();
+      const hasSel = sel && !sel.isCollapsed;
+      if (!hasSel) { showToast('请先选中要加链接的文字', 'warn'); return; }
+      const url = prompt('输入链接地址 (http://…)');
+      if (url) { ed.focus(); document.execCommand('createLink', false, url.trim()); }
+      return;
+    }
+    if (cmd === 'insertImage') {
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.accept = 'image/*';
+      input.onchange = () => {
+        const f = input.files && input.files[0];
+        if (!f) return;
+        const reader = new FileReader();
+        reader.onload = () => { ed.focus(); document.execCommand('insertImage', false, String(reader.result)); };
+        reader.readAsDataURL(f);
+      };
+      input.click();
+      return;
+    }
+    ed.focus();
+    document.execCommand(cmd, false, null);
+  });
+}
+initComposeEditor();
+
 // 点击遮罩层（弹窗外区域）关闭；按下 Esc 键也可关闭
 if (els.modal){
   els.modal.addEventListener('click', (ev) => {
@@ -1474,6 +1544,89 @@ if (els.modal){
     if (card && !card.contains(ev.target)) {
       els.modal.classList.remove('show');
     }
+  });
+}
+
+// ===== 收件人历史自动补全 =====
+const addrInput = els.composeTo;
+const addrSuggest = document.getElementById('compose-addr-suggest');
+let addrSuggestList = [];
+
+// 取得收件人输入框中当前正在编辑的那一段（最后一个逗号后的片段）
+function addrCurrentToken(){
+  const v = addrInput ? addrInput.value : '';
+  const parts = v.split(',');
+  return (parts.length ? parts[parts.length - 1] : v).trim();
+}
+function addrSetToken(value){
+  const v = addrInput ? addrInput.value : '';
+  const parts = v.split(',');
+  parts[parts.length - 1] = (value || '') + ', ';
+  addrInput.value = parts.join(',').replace(/,,\s*$/, ', ');
+  // 光标移到行尾
+  addrInput.focus();
+  const len = addrInput.value.length;
+  try { addrInput.setSelectionRange(len, len); } catch (_) {}
+  addrSuggest.setAttribute('hidden', '');
+}
+function addrRender(items){
+  addrSuggestList = items || [];
+  if (!addrSuggestList.length){ addrSuggest.setAttribute('hidden', ''); return; }
+  addrSuggest.innerHTML = '';
+  addrSuggestList.forEach((it) => {
+    const row = document.createElement('div');
+    row.className = 'addr-item';
+    const labelEl = document.createElement('span');
+    labelEl.className = 'addr-label';
+    labelEl.textContent = it.label || it.email;
+    const mailEl = document.createElement('span');
+    mailEl.className = 'addr-mail';
+    mailEl.textContent = it.email;
+    row.appendChild(labelEl);
+    row.appendChild(mailEl);
+    row.addEventListener('mousedown', (ev) => { ev.preventDefault(); addrSetToken(it.email); });
+    addrSuggest.appendChild(row);
+  });
+  addrSuggest.removeAttribute('hidden');
+}
+let addrTimer = null;
+function addrRefresh(){
+  const token = addrCurrentToken();
+  if (!token){
+    // 无输入时显示最近联系人
+    addrFetch('', false);
+    return;
+  }
+  addrFetch(token, true);
+}
+function addrFetch(q, requireMatch){
+  clearTimeout(addrTimer);
+  addrTimer = setTimeout(async () => {
+    try {
+      const r = await api('/api/addresses?q=' + encodeURIComponent(q) + '&limit=10');
+      const data = await r.json();
+      const list = Array.isArray(data.list) ? data.list : [];
+      addrRender(list);
+    } catch (e) { addrSuggest.setAttribute('hidden', ''); }
+  }, 220);
+}
+if (addrInput && addrSuggest){
+  addrInput.addEventListener('input', addrRefresh);
+  addrInput.addEventListener('focus', addrRefresh);
+  addrInput.addEventListener('dblclick', () => addrFetch('', false));
+  addrInput.addEventListener('blur', () => {
+    // 稍等让 mousedown（选中项）先执行
+    setTimeout(() => addrSuggest.setAttribute('hidden', ''), 200);
+  });
+  addrInput.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape'){ addrSuggest.setAttribute('hidden', ''); return; }
+    if ((ev.key === 'Enter' || ev.key === 'Tab') && addrSuggestList.length && !addrSuggest.hasAttribute('hidden') && addrCurrentToken()){
+      ev.preventDefault();
+      addrSetToken(addrSuggestList[0].email);
+    }
+  });
+  document.addEventListener('pointerdown', (ev) => {
+    if (!addrSuggest.contains(ev.target)){ addrSuggest.setAttribute('hidden', ''); }
   });
 }
 
@@ -2234,6 +2387,11 @@ if (els.tabSent) els.tabSent.onclick = switchToSent;
 window.showSentEmail = async (id) => {
   try {
     const r = await api(`/api/sent/${id}`);
+    if (!r.ok) {
+      const err = await r.text().catch(() => '');
+      showToast('无法打开发件详情：' + (err || `HTTP ${r.status}`), 'warn');
+      return;
+    }
     const email = await r.json();
     els.modalSubject.innerHTML = `
       <span class="modal-icon">📤</span>
