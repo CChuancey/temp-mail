@@ -57,6 +57,9 @@ const els = {
   tgWebhook: document.getElementById('tg-webhook'),
   tgExtra: document.getElementById('tg-extra'),
   domainUsageBody: document.getElementById('domain-usage-body'),
+  forwardConfigInput: document.getElementById('forward-config-input'),
+  forwardConfigSave: document.getElementById('forward-config-save'),
+  forwardConfigMsg: document.getElementById('forward-config-msg'),
   
   // 检查必要的DOM元素是否存在
   checkRequiredElements() {
@@ -604,6 +607,47 @@ async function loadDomainUsage() {
   } catch (e) {
     els.domainUsageBody.textContent = '加载失败：' + (e && e.message ? e.message : e);
   }
+}
+
+function setForwardMsg(text, ok) {
+  if (!els.forwardConfigMsg) return;
+  els.forwardConfigMsg.textContent = text;
+  els.forwardConfigMsg.style.color = ok ? '#16a34a' : '#dc2626';
+}
+
+async function initForwardConfig() {
+  const input = els.forwardConfigInput;
+  const saveBtn = els.forwardConfigSave;
+  if (!input || !saveBtn) return;
+
+  // 加载当前配置
+  try {
+    const r = await api('/api/config/forward');
+    const data = await r.json();
+    if (data && typeof data.forwardTo === 'string') {
+      input.value = data.forwardTo;
+    }
+  } catch (e) { void e; }
+
+  const save = async function() {
+    const forwardTo = String(input.value || '').trim();
+    setForwardMsg('保存中…', true);
+    try {
+      await api('/api/config/forward', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ forwardTo })
+      });
+      setForwardMsg(forwardTo ? '✅ 已保存：' + escapeHtml(forwardTo) : '✅ 已关闭归档转发', true);
+    } catch (e) {
+      setForwardMsg('保存失败：' + (e && e.message ? e.message : e), false);
+    }
+  };
+
+  saveBtn.addEventListener('click', save);
+  input.addEventListener('keydown', function(ev) {
+    if (ev.key === 'Enter') { ev.preventDefault(); save(); }
+  });
 }
 
 function setTelegramStatusBadge(state) {
@@ -1374,7 +1418,8 @@ window.addEventListener('blur', () => {
     await loadUsers();
     await loadTelegramStatus();
     await loadDomainUsage();
-  } catch(_) { 
+    initForwardConfig();
+  } catch(_) {
     if (els.demoBanner) {
       els.demoBanner.remove();
     }
@@ -1382,6 +1427,7 @@ window.addEventListener('blur', () => {
       await loadUsers();
       await loadTelegramStatus();
       await loadDomainUsage();
+      initForwardConfig();
     } catch(e) {
       void e;
     }

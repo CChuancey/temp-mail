@@ -189,6 +189,26 @@
             加载中…
           </div>
         </div>
+        <div class="card" id="forward-config-card">
+          <div class="card-header">
+            <h2>
+              <span class="card-icon">🔁</span>
+              <span>邮件归档转发</span>
+            </h2>
+          </div>
+          <div style="padding:12px 12px 16px 12px;">
+            <p style="margin:0 0 10px 0;font-size:13px;color:#94a3b8;">入站与外发邮件将转发一份副本到该邮箱（需在 Email Routing 中验证）。留空表示关闭归档转发。</p>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;">
+              <input id="forward-config-input" type="email" placeholder="forward@example.com"
+                style="flex:1;min-width:220px;padding:8px 10px;border:1px solid var(--border,#e2e8f0);border-radius:8px;background:var(--input-bg,#fff);color:var(--text,#0f172a);font-size:13px;outline:none;" />
+              <button id="forward-config-save" class="btn btn-primary btn-sm">
+                <span>💾</span>
+                <span>保存</span>
+              </button>
+            </div>
+            <div id="forward-config-msg" style="margin-top:8px;font-size:13px;"></div>
+          </div>
+        </div>
         <div class="card">
           <div class="card-header">
             <h2><span class="card-icon">📦</span><span>用户的邮箱列表</span><span id="mailboxes-count" class="mailboxes-count">（0 邮箱）</span></h2>
