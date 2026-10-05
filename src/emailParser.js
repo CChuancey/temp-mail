@@ -25,6 +25,10 @@ function parseEntity(headers, body) {
 
   // 单体：text/html 或 text/plain
   if (!ct.startsWith('multipart/')) {
+    // 内嵌资源/附件（image/*、application/* 等二进制）不是正文，不作为文本，避免把 PNG 当文字展示
+    if (isBinaryContentType(ct)) {
+      return { text: '', html: '' };
+    }
     const decoded = decodeBodyWithCharset(body, transferEnc, ct);
     const isHtml = ct.includes('text/html');
     const isText = ct.includes('text/plain') || !isHtml;
@@ -274,6 +278,241 @@ function guessHtmlFromRaw(raw) {
  */
 function escapeHtml(s) {
   return s.replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;','\'': '&#39;' }[c] || c));
+}
+
+/**
+ * 判断 Content-Type 是否为二进制资源/附件（不作为正文文本）
+ */
+function isBinaryContentType(ct) {
+  return /^(image|audio|video|application|font|model)\/|^application\//i.test(String(ct || '').trim());
+}
+
+/**
+ * 将原始邮件中内嵌的 image/* 部件映射为 data URI，并把 HTML 正文里的 cid:xxx
+ * 引用替换为可显示的 data URI，使内嵌图片在前端 iframe 中能正常渲染。
+ * @param {string} raw - 原始 MIME 邮件
+ * @param {string} html - 邮件 HTML 正文
+ * @returns {string} 替换完内嵌图片后的 HTML
+ */
+export function resolveInlineImages(raw, html) {
+  if (!raw || !html || !/cid:/i.test(html)) { return html; }
+  const cidMap = {};
+  try {
+    const { headers, body } = splitHeadersAndBody(raw);
+    collectCidImageParts(headers, body, cidMap);
+  } catch (err) { void err; }
+  if (!Object.keys(cidMap).length) { return html; }
+  return String(html).replace(/cid:([^"')\s<>;]+)/gi, function(match, rawCid) {
+    const cid = String(rawCid).replace(/^<|>$/g, '').trim();
+    if (!cid) { return match; }
+    return cidMap[cid] || cidMap[cid.toLowerCase()]
+      || cidMap['<' + cid + '>'] || cidMap['<' + cid.toLowerCase() + '>']
+      || match;
+  });
+}
+
+/**
+ * 将富文本中的 cid: 内嵌引用替换为 data URI（用于本地展示，如发件箱预览）。
+ * 入参为 Resend 附件数组（前端把 data URI 图片转成了 content_id + content(base64)）。
+ * 与 resolveInlineImages 不同：这里不解析 MIME 树，直接按 content_id 一对一替换。
+ */
+export function resolveCidAttachments(html, attachments) {
+  if (!html || !Array.isArray(attachments) || !attachments.length || !/cid:/i.test(html)) { return html; }
+  const mimeByExt = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml', bmp: 'image/bmp' };
+  let out = String(html);
+  for (const a of attachments) {
+    if (!a || !a.content_id || !a.content) { continue; }
+    const cid = String(a.content_id);
+    const ext = String(a.filename || '').split('.').pop().toLowerCase();
+    const mime = mimeByExt[ext] || 'image/png';
+    const dataUri = 'data:' + mime + ';base64,' + String(a.content);
+    out = out.split('cid:' + cid).join(dataUri);
+  }
+  return out;
+}
+
+/**
+ * 递归遍历 multipart，收集所有带 Content-ID 的 image/* 部件的 data URI
+ */
+function collectCidImageParts(headers, body, cidMap) {
+  const ctRaw = headers['content-type'] || '';
+  const ct = ctRaw.toLowerCase();
+  if (!ct.startsWith('multipart/')) {
+    try { maybeRecordCidImage(headers, body, cidMap); } catch (err) { void err; }
+    return;
+  }
+  const boundary = getBoundary(ctRaw);
+  if (!boundary) { return; }
+  const parts = splitMultipart(body, boundary);
+  for (const part of parts) {
+    const { headers: ph, body: pb } = splitHeadersAndBody(part);
+    collectCidImageParts(ph, pb, cidMap);
+  }
+}
+
+/**
+ * 判断单个 part 是否为带 Content-ID 的图片，若是则记录 data URI
+ */
+function maybeRecordCidImage(headers, body, cidMap) {
+  const ctRaw = String(headers['content-type'] || '');
+  if (!/^\s*image\//i.test(ctRaw)) { return; }
+  const cidHeader = String(headers['content-id'] || '').trim();
+  const cid = cidHeader.replace(/^<|>$/g, '').trim();
+  if (!cid || !body) { return; }
+  const transferEnc = String(headers['content-transfer-encoding'] || '').trim().toLowerCase();
+  const bytes = mimeBodyToBytes(body, transferEnc);
+  if (!bytes || !bytes.length) { return; }
+  const mimeType = ctRaw.split(';')[0].trim().toLowerCase() || 'image/png';
+  const dataUri = 'data:' + mimeType + ';base64,' + bytesToBase64(bytes);
+  cidMap[cid] = dataUri;
+  if (cidMap[cid.toLowerCase()] === undefined) { cidMap[cid.toLowerCase()] = dataUri; }
+  if (cidMap['<' + cid + '>'] === undefined) { cidMap['<' + cid + '>'] = dataUri; }
+}
+
+/**
+ * 将传输编码的 part 体解码为字节数组（base64 / quoted-printable / 8bit）
+ */
+function mimeBodyToBytes(body, transferEnc) {
+  if (transferEnc === 'base64') {
+    const b64 = String(body).replace(/\s+/g, '');
+    if (!b64) { return null; }
+    try {
+      const bin = atob(b64);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) { bytes[i] = bin.charCodeAt(i); }
+      return bytes;
+    } catch (e) { void e; return null; }
+  }
+  if (transferEnc === 'quoted-printable') {
+    return quotedPrintableToBytes(String(body));
+  }
+  // 7bit/8bit/binary：按 latin1 逐字符取 0-255
+  const s = String(body);
+  const bytes = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) { bytes[i] = s.charCodeAt(i) & 0xff; }
+  return bytes;
+}
+
+/**
+ * Quoted-Printable 解码为字节数组
+ */
+function quotedPrintableToBytes(input) {
+  const s = String(input).replace(/=\r?\n/g, '');
+  const byteList = [];
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === '=' && i + 2 < s.length) {
+      const hex = s.substring(i + 1, i + 3);
+      if (/^[0-9A-Fa-f]{2}$/.test(hex)) {
+        byteList.push(parseInt(hex, 16));
+        i += 2;
+        continue;
+      }
+    }
+    byteList.push(ch.charCodeAt(0) & 0xff);
+  }
+  return new Uint8Array(byteList);
+}
+
+/**
+ * 解码 RFC 2047 编码字（=??B?..?= / =??Q?..?=），用于主题、发件人显示
+ * @param {string} str - 可能含编码字的原始字符串
+ * @returns {string} 解码后的字符串
+ */
+export function decodeEncodedWords(str) {
+  if (!str || String(str).indexOf('=?') === -1) { return str; }
+  return String(str)
+    // 合并相邻编码字之间残留的空白（如 "?= =?" 之间的空格）
+    .replace(/(=\?[^?\r\n]+\?[BbQq]\?[^?\r\n]*\?=)\s+(?==\?[^?\r\n]+\?[BbQq]\?)/g, '$1')
+    // 解码每个编码字
+    .replace(/=\?([^?]+)\?([BbQq])\?([^?]*)\?=/g, function(m, charset, enc, text) {
+      try {
+        if (enc.toUpperCase() === 'B') { return base64ToUtf8(text); }
+        return qEncodedToStr(text);
+      } catch (e) { void e; return m; }
+    });
+}
+
+/**
+ * base64 字符串解码为 UTF-8 文本（用于 RFC2047 B 编码）
+ */
+function base64ToUtf8(b64) {
+  const bin = atob(String(b64).replace(/\s+/g, ''));
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) { bytes[i] = bin.charCodeAt(i); }
+  return new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+}
+
+/**
+ * RFC2047 Q 编码字符串解码为 UTF-8 文本（"_"=空格，=XX=字节）
+ */
+function qEncodedToStr(input) {
+  const s = String(input);
+  const byteList = [];
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === '_') { byteList.push(32); continue; }
+    if (ch === '=' && i + 2 < s.length) {
+      const hex = s.substring(i + 1, i + 3);
+      if (/^[0-9A-Fa-f]{2}$/.test(hex)) { byteList.push(parseInt(hex, 16)); i += 2; continue; }
+    }
+    byteList.push(ch.charCodeAt(0) & 0xff);
+  }
+  return new TextDecoder('utf-8', { fatal: false }).decode(new Uint8Array(byteList));
+}
+
+/**
+ * 提取原始邮件中的所有内嵌图片（用于发给 Telegram 的媒体组），无图片返回空数组
+ * @param {string} raw - 原始 MIME 邮件
+ * @returns {Array<{data: Uint8Array, mimeType: string}>}
+ */
+export function extractInlineImages(raw) {
+  if (!raw) { return []; }
+  const images = [];
+  try {
+    const { headers, body } = splitHeadersAndBody(raw);
+    collectInlineImages(headers, body, images);
+  } catch (e) { void e; }
+  return images;
+}
+
+/**
+ * 递归收集所有 image/* 部件
+ */
+function collectInlineImages(headers, body, images) {
+  const ctRaw = String(headers['content-type'] || '');
+  const ct = ctRaw.toLowerCase();
+  if (!ct.startsWith('multipart/')) {
+    if (!/^\s*image\//i.test(ctRaw)) { return; }
+    const transferEnc = String(headers['content-transfer-encoding'] || '').trim().toLowerCase();
+    const bytes = mimeBodyToBytes(body, transferEnc);
+    if (bytes && bytes.length) {
+      images.push({
+        data: bytes,
+        mimeType: ctRaw.split(';')[0].trim().toLowerCase() || 'image/jpeg'
+      });
+    }
+    return;
+  }
+  const boundary = getBoundary(ctRaw);
+  if (!boundary) { return; }
+  const parts = splitMultipart(body, boundary);
+  for (const part of parts) {
+    const { headers: ph, body: pb } = splitHeadersAndBody(part);
+    collectInlineImages(ph, pb, images);
+  }
+}
+
+/**
+ * 字节数组编码为 base64 字符串
+ */
+function bytesToBase64(bytes) {
+  const CHUNK = 0x8000;
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(bin);
 }
 
 /**

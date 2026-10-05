@@ -1,6 +1,6 @@
-import { initDatabase, syncDomains } from './database.js';
+import { initDatabase, syncDomains, getAppConfig } from './database.js';
 import { handleEmailReceive } from './apiHandlers.js';
-import { parseEmailBody } from './emailParser.js';
+import { parseEmailBody, decodeEncodedWords } from './emailParser.js';
 import { createRouter, authMiddleware } from './routes.js';
 import { createAssetManager } from './assetManager.js';
 import { getDatabaseWithValidation } from './dbConnectionHelper.js';
@@ -59,7 +59,34 @@ export default {
           headers: rateLimitResult.headers
         });
       }
-      
+
+      // 公开媒体路由：从 R2 读取内嵌图片（供 Telegram 链接预览等场景抓取，无需鉴权）
+      if (url.pathname.startsWith('/media/')) {
+        const mediaKey = url.pathname.slice('/media/'.length);
+        if (!mediaKey || !/^[a-zA-Z0-9._-]+$/.test(mediaKey)) {
+          return new Response('Bad Request', { status: 400 });
+        }
+        try {
+          const r2 = env.MAIL_EML;
+          if (!r2) {
+            logger.error('媒体读取失败: R2 未绑定', null, { mediaKey }, logId);
+            return new Response('R2 未绑定', { status: 500 });
+          }
+          const obj = await r2.get(`media/${mediaKey}`);
+          if (!obj) {
+            logger.warn('媒体不存在', { mediaKey }, logId);
+            return new Response('Not Found', { status: 404 });
+          }
+          const headers = new Headers();
+          headers.set('Content-Type', (obj.httpMetadata && obj.httpMetadata.contentType) || 'application/octet-stream');
+          headers.set('Cache-Control', 'public, max-age=31536000, immutable');
+          return new Response(obj.body, { headers });
+        } catch (e) {
+          logger.error('媒体读取异常', e, { mediaKey }, logId);
+          return new Response('Internal Error', { status: 500 });
+        }
+      }
+
       try {
         DB = await getDatabaseWithValidation(env);
         logger.debug('数据库连接成功', {}, logId);
@@ -156,73 +183,89 @@ export default {
    */
   async email(message, env, ctx) {
     const logId = logger.generateLogId ? logger.generateLogId() : `email-${Date.now()}`;
-    
+
+    // 解码 RFC 2047 编码字（=?UTF-8?B?...?= 等），否则主题/发件人显示为乱码
+    const subject = decodeEncodedWords(message.headers.get('subject') || '(无主题)');
+    const envelopeFrom = message.from || '';
+    const headerFrom = decodeEncodedWords(message.headers.get('from') || envelopeFrom);
+
+    logger.info('邮件接收开始', {
+      from: envelopeFrom,
+      to: message.to,
+      subject: subject.substring(0, 100)
+    }, logId);
+
+    // 解析邮件内容（轻量操作，不执行数据库/存储/通知等慢操作）
+    let text = '';
+    let html = '';
+    let raw = '';
     try {
-      const subject = message.headers.get('subject') || '(无主题)';
-      const envelopeFrom = message.from || '';
-      const headerFrom = message.headers.get('from') || envelopeFrom;
-      
-      logger.info('邮件接收开始', {
-        from: envelopeFrom,
-        to: message.to,
-        subject: subject.substring(0, 100)
-      }, logId);
-      
+      raw = await new Response(message.raw).text();
+      const parsed = parseEmailBody(raw);
+      text = parsed.text;
+      html = parsed.html;
+    } catch (e) {
+      logger.error('邮件解析失败', e, {}, logId);
+      text = '邮件内容解析失败';
+    }
+
+    const emailData = {
+      from: headerFrom,
+      envelope_from: envelopeFrom,
+      to: message.to,
+      subject: subject,
+      text,
+      html,
+      raw
+    };
+
+    // 归档转发目标：需在 Email Routing 中验证该目标地址
+    // 优先取配置表（前端可配置），其次回退 env.ARCHIVE_FORWARD_TO
+    let archiveTo = (env.ARCHIVE_FORWARD_TO || '').trim();
+    try {
       const DB = await getDatabaseWithValidation(env);
-      
-      // 初始化数据库
-      await initDatabase(DB);
-      
-      // 解析邮件内容
-      let text = '';
-      let html = '';
+      const stored = await getAppConfig(DB, 'ARCHIVE_FORWARD_TO');
+      if (stored && stored.value && String(stored.value).trim()) {
+        archiveTo = String(stored.value).trim();
+      }
+    } catch (err) {
+      void err;
+    }
+
+    // 立即并行触发转发，避免被入库/存储/Telegram 通知等慢操作阻塞（修复转发延迟）
+    const forwardTask = (async() => {
+      if (!archiveTo) { return; }
       try {
-        const raw = await new Response(message.raw).text();
-        const parsed = parseEmailBody(raw);
-        text = parsed.text;
-        html = parsed.html;
-      } catch (e) {
-        logger.error('邮件解析失败', e, {}, logId);
-        text = '邮件内容解析失败';
+        await message.forward(archiveTo);
+        logger.info('归档转发成功', { to: archiveTo }, logId);
+      } catch (err) {
+        logger.error('归档转发失败', err, { to: archiveTo }, logId);
       }
-      
-      const emailData = {
-        from: headerFrom,
-        envelope_from: envelopeFrom,
-        to: message.to,
-        subject: subject,
-        text,
-        html
-      };
-      
-      // 处理邮件接收
-      const result = await handleEmailReceive(emailData, DB, env);
+    })();
 
-      // 归档转发：将原始邮件静默转发到指定邮箱（需在 Email Routing 中验证该目标地址）
-      // 转发失败仅记录日志，不影响正常收信流程
-      const archiveTo = (env.ARCHIVE_FORWARD_TO || '').trim();
-      if (archiveTo) {
-        const forwardPromise = message.forward(archiveTo)
-          .then(() => logger.info('归档转发成功', { to: archiveTo }, logId))
-          .catch(err => logger.error('归档转发失败', err, { to: archiveTo }, logId));
-        if (ctx && typeof ctx.waitUntil === 'function') {
-          ctx.waitUntil(forwardPromise);
-        } else {
-          await forwardPromise;
-        }
+    // 后台入库/归档：写入数据库、R2 存储、发送 Telegram 通知等（不阻塞转发）
+    const processTask = (async() => {
+      try {
+        const DB = await getDatabaseWithValidation(env);
+        await initDatabase(DB);
+        await handleEmailReceive(emailData, DB, env);
+        logger.info('邮件处理完成', {
+          messageId: message.headers.get('Message-ID')
+        }, logId);
+      } catch (error) {
+        logger.error('邮件处理错误', error, {
+          from: message.from,
+          to: message.to
+        }, logId);
       }
+    })();
 
-      logger.info('邮件处理完成', {
-        result: result?.status,
-        messageId: message.headers.get('Message-ID')
-      }, logId);
-      
-    } catch (error) {
-      logger.error('邮件处理错误', error, {
-        from: message.from,
-        to: message.to
-      }, logId);
-      throw error;
+    // Email Routing：通过 waitUntil 挂起后台任务，立即返回以尽量缩短延迟
+    if (ctx && typeof ctx.waitUntil === 'function') {
+      ctx.waitUntil(forwardTask);
+      ctx.waitUntil(processTask);
+    } else {
+      await Promise.allSettled([forwardTask, processTask]);
     }
   }
 };
