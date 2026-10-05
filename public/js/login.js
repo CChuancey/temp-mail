@@ -198,15 +198,15 @@ async function initLoginBanner() {
     }
 
     if (needDemoBanner) {
-      infoBannerTitle.textContent = '当前为官方体验站 / 共享环境，请勿存放或发送敏感信息。';
-      infoBannerDesc.textContent = '该环境仅用于体验与演示，数据可能会定期清理。如需长期稳定使用，推荐 Fork 仓库自建部署。';
+      infoBannerTitle.textContent = '当前为共享体验环境，请勿存放或发送敏感信息。';
+      infoBannerDesc.textContent = '该环境仅用于体验与演示，数据可能会定期清理。';
       infoBanner.hidden = false;
       return;
     }
 
     if (needGuestBanner) {
       infoBannerTitle.textContent = '当前为访客模式（权限受限）。';
-      infoBannerDesc.textContent = '您可以使用访客账号体验主要功能，但部分管理与配置能力已关闭。如需完整权限，请使用管理员账号或自建部署。';
+      infoBannerDesc.textContent = '您可以使用访客账号体验主要功能，但部分管理与配置能力已关闭。';
       infoBannerLink.style.display = 'none';
       infoBanner.hidden = false;
       return;

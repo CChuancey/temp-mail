@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>登录 - Temp Email</title>
+    <title>登录 - 邮件中心</title>
     <style>.precheck-hide body{ visibility: hidden; }</style>
     <script>
       // 立即检查登录状态（在任何其他脚本之前）
@@ -98,26 +98,25 @@
       })();
     </script>
     
-    <link rel="icon" href="favicon.svg" type="image/svg+xml" />
-    <link rel="shortcut icon" href="favicon.svg" type="image/svg+xml" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="shortcut icon" href="/favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="/css/login.css" />
   </head>
   <body>
     <div class="bg"></div>
     <div class="center">
       <div class="card">
-        <div class="logo"></div>
+        <div class="logo">
+          <svg viewBox="0 0 48 48" width="52" height="52" aria-hidden="true">
+            <circle cx="24" cy="24" r="22" fill="#0f766e"/>
+            <rect x="12" y="16" width="24" height="17" rx="3" fill="none" stroke="#ecfdf5" stroke-width="2.4"/>
+            <path d="M14 19l10 8 10-8" fill="none" stroke="#ecfdf5" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </div>
         <h1 class="login-title">
-          <span class="login-title-text">登录到 Temp Email</span>
-          <a
-            class="login-doc-link"
-            href="https://github.com/noxenys/temp-mail/blob/main/DEPLOYMENT_GUIDE.md"
-            target="_blank"
-            rel="noreferrer"
-          >
-            部署文档
-          </a>
+          <span class="login-title-text">邮件中心</span>
         </h1>
+        <p class="login-subtitle">请登录以继续</p>
 
         <div id="info-banner" class="info-banner" hidden>
           <div class="info-banner-icon" aria-hidden="true">i</div>
@@ -128,11 +127,9 @@
           <a
             id="info-banner-link"
             class="info-banner-link"
-            href="https://github.com/noxenys/temp-mail/blob/main/DEPLOYMENT_GUIDE.md"
-            target="_blank"
-            rel="noreferrer"
+            href="#"
           >
-            查看文档
+            了解更多
           </a>
         </div>
 
