@@ -8,18 +8,21 @@ import { sendEmailWithAutoResend } from './emailSender.js';
  * @param {object} env - 环境变量
  * @param {string} text - 消息内容
  * @param {string} [parseMode='HTML'] - 解析模式
+ * @param {object} [opts] - 附加选项，如 { disableWebPagePreview: false } 以启用链接预览
  */
-export async function sendTelegramMessage(env, text, parseMode = 'HTML') {
-  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
+export async function sendTelegramMessage(env, text, parseMode = 'HTML', opts = {}) {
+  const botToken = String(env.TELEGRAM_BOT_TOKEN || '').trim();
+  const chatId = String(env.TELEGRAM_CHAT_ID || '').trim();
+  if (!botToken || !chatId) {
     return;
   }
-  
-  const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
+
+  const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
   const payload = {
-    chat_id: env.TELEGRAM_CHAT_ID,
+    chat_id: chatId,
     text: text,
     parse_mode: parseMode,
-    disable_web_page_preview: true
+    disable_web_page_preview: opts.disableWebPagePreview !== false
   };
   
   try {
@@ -35,6 +38,82 @@ export async function sendTelegramMessage(env, text, parseMode = 'HTML') {
     }
   } catch (e) {
     logger.error('Telegram Request Failed', e);
+  }
+}
+
+/**
+ * 发送图片消息（sendPhoto），caption 可附带富文本说明
+ * @param {object} env - 含 TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
+ * @param {string} caption - 图片说明文字（支持 HTML）
+ * @param {Uint8Array|ArrayBuffer} photoBytes - 图片字节
+ * @param {string} mimeType - 图片 MIME 类型
+ */
+export async function sendTelegramPhoto(env, caption, photoBytes, mimeType = 'image/jpeg') {
+  const botToken = String(env.TELEGRAM_BOT_TOKEN || '').trim();
+  const chatId = String(env.TELEGRAM_CHAT_ID || '').trim();
+  if (!botToken || !chatId || !photoBytes) { return; }
+  const ext = String(mimeType || 'image/jpeg').split('/')[1] || 'jpg';
+  const url = `https://api.telegram.org/bot${botToken}/sendPhoto`;
+  try {
+    const form = new FormData();
+    form.append('chat_id', chatId);
+    if (caption) { form.append('caption', caption); }
+    form.append('parse_mode', 'HTML');
+    form.append('photo', new Blob([photoBytes], { type: mimeType || 'image/jpeg' }), 'image.' + ext);
+    const resp = await fetch(url, { method: 'POST', body: form });
+    if (!resp.ok) {
+      const errorText = await resp.text();
+      logger.error('Telegram sendPhoto API Error', errorText);
+    }
+  } catch (e) {
+    logger.error('Telegram sendPhoto Failed', e);
+  }
+}
+
+/**
+ * 以媒体组（相册）发送多张图片，caption 支持 HTML 富文本。
+ * Telegram 单个媒体组最多 10 张，超出会自动分批发送，说明文字仅放在第一批首图。
+ * @param {object} env - 含 TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
+ * @param {string} caption - 相册说明文字（支持 HTML）
+ * @param {Array<{data: Uint8Array|ArrayBuffer, mimeType: string}>} images - 图片列表
+ */
+export async function sendTelegramMediaGroup(env, caption, images) {
+  const botToken = String(env.TELEGRAM_BOT_TOKEN || '').trim();
+  const chatId = String(env.TELEGRAM_CHAT_ID || '').trim();
+  if (!botToken || !chatId || !Array.isArray(images) || !images.length) { return; }
+
+  const batches = [];
+  for (let i = 0; i < images.length; i += 10) {
+    batches.push(images.slice(i, i + 10));
+  }
+
+  for (let b = 0; b < batches.length; b++) {
+    const batch = batches[b];
+    const url = `https://api.telegram.org/bot${botToken}/sendMediaGroup`;
+    try {
+      const form = new FormData();
+      form.append('chat_id', chatId);
+      const media = batch.map((img, i) => {
+        const mime = String(img && img.mimeType ? img.mimeType : 'image/jpeg');
+        const ext = mime.split('/')[1] || 'jpg';
+        const attachName = `file${b}_${i}`;
+        form.append(attachName, new Blob([img.data], { type: mime }), `image${b}_${i}.${ext}`);
+        const item = { type: 'photo', media: 'attach://' + attachName };
+        if (b === 0 && i === 0 && caption) {
+          item.caption = caption;
+          item.parse_mode = 'HTML';
+        }
+        return item;
+      });
+      form.append('media', JSON.stringify(media));
+      const resp = await fetch(url, { method: 'POST', body: form });
+      if (!resp.ok) {
+        const errorText = await resp.text();
+        logger.error('Telegram sendMediaGroup API Error', errorText);
+      }
+    } catch (e) {
+      logger.error('Telegram sendMediaGroup Failed', e);
+    }
   }
 }
 
@@ -71,8 +150,9 @@ export async function handleTelegramWebhook(request, env, db) {
     const text = msg.text.trim();
     const username = msg.from.username || '';
 
-    // 安全检查：如果配置了 TELEGRAM_CHAT_ID，则只允许该 ID 操作
-    if (env.TELEGRAM_CHAT_ID && String(env.TELEGRAM_CHAT_ID) !== String(chatId)) {
+    // 安全检查：如果配置了 TELEGRAM_CHAT_ID，则只允许该 ID 操作（忽略首尾空白）
+    const boundChatId = String(env.TELEGRAM_CHAT_ID || '').trim();
+    if (boundChatId && String(boundChatId) !== String(chatId)) {
       logger.warn('Unauthorized Telegram Access', { chatId, expected: env.TELEGRAM_CHAT_ID }, logId);
       return new Response('OK');
     }
@@ -184,16 +264,8 @@ export async function handleTelegramWebhook(request, env, db) {
       let mailboxes;
       const role = String(user.role || '');
       if (role === 'admin') {
-        const name = String(user.username || '');
-        const adminName = env.ADMIN_NAME ? String(env.ADMIN_NAME) : null;
-        const isRoot = name === '__root__';
-        const isNamedAdmin = adminName ? name.toLowerCase() === adminName.toLowerCase() : true;
-        const isStrictAdmin = isRoot || isNamedAdmin;
-        if (isStrictAdmin) {
-          mailboxes = await getAdminMailboxes(db, user.id);
-        } else {
-          mailboxes = await getUserMailboxes(db, user.id);
-        }
+        // 所有 role=admin 的账号（含 chuancey）均视为严格管理员，可见全部邮箱
+        mailboxes = await getAdminMailboxes(db, user.id);
       } else {
         mailboxes = await getUserMailboxes(db, user.id);
       }
@@ -545,7 +617,9 @@ async function sendAndRecord(db, resendConfig, user, { from, to, subject, conten
 }
 
 async function replyTelegram(env, chatId, text, parseMode = null) {
-  const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
+  const botToken = String(env.TELEGRAM_BOT_TOKEN || '').trim();
+  if (!botToken) { return; }
+  const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
   const payload = {
     chat_id: chatId,
     text: text,

@@ -2,11 +2,12 @@
 import { extractEmail, generateRandomId } from './commonUtils.js';
 import { getOrCreateMailboxId, getMailboxIdByAddress, recordSentEmail, updateSentEmail, toggleMailboxPin, 
   listUsersWithCounts, createUser, updateUser, deleteUser, assignMailboxToUser, getUserMailboxes, unassignMailboxFromUser, 
-  checkMailboxOwnership, getTotalMailboxCount, cleanupOldMessages, isSenderBlocked, listBlockedSenders, addBlockedSender, deleteBlockedSender, setMessagePinned } from './database.js';
+  checkMailboxOwnership, getTotalMailboxCount, cleanupOldMessages, isSenderBlocked, listBlockedSenders, addBlockedSender, deleteBlockedSender, setMessagePinned,
+  getAppConfig, setAppConfig } from './database.js';
 import { checkCustomRateLimit } from './rateLimit.js';
-import { parseEmailBody, extractVerificationCode, extractLoginLink } from './emailParser.js';
+import { parseEmailBody, extractVerificationCode, extractLoginLink, resolveInlineImages, resolveCidAttachments, extractInlineImages } from './emailParser.js';
 import { sendEmailWithAutoResend, sendBatchWithAutoResend, getEmailFromResend, updateEmailInResend, cancelEmailInResend } from './emailSender.js';
-import { sendTelegramMessage } from './telegram.js';
+import { sendTelegramMessage, sendTelegramPhoto, sendTelegramMediaGroup } from './telegram.js';
 import logger from './logger.js';
 
 function escapeHtml(str) {
@@ -127,11 +128,9 @@ export async function handleApiRequest(request, db, mailDomains, options = { res
   function isStrictAdmin() {
     const p = getJwtPayload();
     if (!p) {return false;}
-    if (p.role !== 'admin') {return false;}
-    // __root__（根管理员）视为严格管理员
-    if (String(p.username || '') === '__root__') {return true;}
-    if (options?.adminName) { return String(p.username || '').toLowerCase() === String(options.adminName || '').toLowerCase(); }
-    return true;
+    // 严格管理员：role 为 admin 即视为管理员（不再限定用户名等于 ADMIN_NAME）。
+    // 使数据库中以 role=admin 授予的管理员账号（如 chuancey）与 admin 享有相同最高权限、共享全部邮箱。
+    return p.role === 'admin';
   }
   
   async function sha256Hex(text) {
@@ -754,13 +753,11 @@ export async function handleApiRequest(request, db, mailDomains, options = { res
       const payload = getJwtPayload();
       const uid = Number(payload?.userId || 0);
       const role = payload?.role || 'user';
-      const username = String(payload?.username || '').trim().toLowerCase();
-      const adminName = String(options.adminName || 'admin').trim().toLowerCase();
+
+      logger.info({ logId, action: 'get_user_quota', params: { userId: uid, role, username: String(payload?.username || '') } });
       
-      logger.info({ logId, action: 'get_user_quota', params: { userId: uid, role, username } });
-      
-      // 检查是否为超级管理员
-      const isSuperAdmin = (role === 'admin' && (username === adminName || username === '__root__'));
+      // 检查是否为超级管理员（role=admin 即视为，权限与 ADMIN_NAME 一致）
+      const isSuperAdmin = (role === 'admin');
       
       if (isSuperAdmin) {
         // 超级管理员：显示系统中所有邮箱的总数
@@ -851,12 +848,14 @@ export async function handleApiRequest(request, db, mailDomains, options = { res
       
       logger.info({ logId, action: 'get_sent_detail', params: { userId: uid, sentId } });
       
-      // 查询发件详情
-      const sent = await db.prepare(`
-        SELECT * FROM sent_emails 
-        WHERE id = ? AND user_id = ?
-      `).bind(sentId, uid).first();
-      
+      // 查询发件详情：严格管理员可见任意记录；普通用户仅可见自己的记录
+      let sent;
+      if (isStrictAdmin()) {
+        sent = await db.prepare('SELECT * FROM sent_emails WHERE id = ?').bind(sentId).first();
+      } else {
+        sent = await db.prepare('SELECT * FROM sent_emails WHERE id = ? AND user_id = ?').bind(sentId, uid).first();
+      }
+
       if (!sent) {
         logger.warn({ logId, action: 'get_sent_detail', error: 'not_found', userId: uid, sentId });
         return new Response('发件记录不存在', { status: 404 });
@@ -894,6 +893,81 @@ export async function handleApiRequest(request, db, mailDomains, options = { res
     return false;
   }
   
+  // 历史收发人地址自动补全（供发信弹窗使用）
+  if (path === '/api/addresses' && request.method === 'GET') {
+    try {
+      const qRaw = String(url.searchParams.get('q') || '').trim().toLowerCase();
+      const qq = qRaw.replace(/[^a-z0-9@._-]/g, '');
+      const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit') || '12', 10), 1), 30);
+      const payloadUser = getJwtPayload();
+      const uid = Number(payloadUser?.userId || 0);
+      const strictAdmin = isStrictAdmin();
+      const like = '%' + qq + '%';
+
+      // 非管理员：仅从这个用户关联的邮箱收发历史里取；管理员可见全局
+      let mailboxAddrs = null;
+      if (!strictAdmin && uid) {
+        const boxes = await getUserMailboxes(db, uid);
+        mailboxAddrs = (boxes || []).map(b => b.address).filter(Boolean);
+      }
+
+      const candidates = new Map();
+      function addCand(raw) {
+        const email = extractEmail(String(raw || '')).toLowerCase();
+        if (!email) { return; }
+        const nameM = /^([^<]+)</.exec(String(raw || ''));
+        const name = nameM ? nameM[1].trim().replace(/^["']+|["']+$/g, '') : '';
+        const existing = candidates.get(email);
+        if (existing) {
+          existing.cnt += 1;
+          if (!existing.label || existing.label === email) { existing.label = name || email; }
+        } else {
+          candidates.set(email, { email, label: name || email, cnt: 1, lastAt: '' });
+        }
+      }
+
+      // 收到的邮件：发件人即潜在收件人
+      let senderRows = [];
+      try {
+        if (mailboxAddrs && mailboxAddrs.length) {
+          const placeholders = mailboxAddrs.map(() => '?').join(',');
+          senderRows = (await db.prepare(
+            `SELECT sender AS raw, COUNT(*) AS cnt, MAX(received_at) AS lastAt FROM messages
+              WHERE sender LIKE ? AND mailbox_id IN (${placeholders})
+              GROUP BY sender ORDER BY cnt DESC LIMIT ?`
+          ).bind(like, ...mailboxAddrs, limit).all()).results || [];
+        } else {
+          senderRows = (await db.prepare(
+            `SELECT sender AS raw, COUNT(*) AS cnt, MAX(received_at) AS lastAt FROM messages
+              WHERE sender LIKE ? GROUP BY sender ORDER BY cnt DESC LIMIT ?`
+          ).bind(like, limit).all()).results || [];
+        }
+        for (const r of senderRows) { addCand(r.raw); }
+      } catch (e) { void e; }
+
+      // 我们主动发过的邮件：收件人
+      try {
+        const sentRows = (await db.prepare(
+          `SELECT to_addrs AS raw, COUNT(*) AS cnt, MAX(created_at) AS lastAt FROM sent_emails
+            WHERE to_addrs LIKE ? GROUP BY to_addrs ORDER BY cnt DESC LIMIT 60`
+        ).bind(like).all()).results || [];
+        for (const r of sentRows) {
+          String(r.raw || '').split(',').forEach(part => addCand(part));
+        }
+      } catch (e) { void e; }
+
+      const sorted = Array.from(candidates.values())
+        .sort((a, b) => (b.cnt - a.cnt) || String(b.lastAt || '').localeCompare(String(a.lastAt || '')))
+        .slice(0, limit);
+
+      logger.info({ logId, action: 'address_autocomplete', query: qRaw, returned: sorted.length, status: 200 });
+      return Response.json({ list: sorted });
+    } catch (e) {
+      logger.error({ logId, action: 'address_autocomplete', error: e.message, status: 500 });
+      return Response.json({ list: [] });
+    }
+  }
+
   // 发送单封邮件
   if (path === '/api/send' && request.method === 'POST') {
     // 空值守卫：检查 RESEND_API_KEY 配置
@@ -933,6 +1007,11 @@ export async function handleApiRequest(request, db, mailDomains, options = { res
       }
       
       // 使用智能发送，根据发件人域名自动选择API密钥
+      const archiveForwardTo = await resolveArchiveForwardTo(db, options.env);
+      // 归档副本：若配置了转发邮箱且不在收件人/抄送/密送中，追加到 bcc（from 为临时域地址时可被私人邮箱收到）
+      if (archiveForwardTo && !isRecipientListed(sendPayload, archiveForwardTo)) {
+        sendPayload = { ...sendPayload, bcc: [archiveForwardTo].concat(sendPayload.bcc || []) };
+      }
       const result = await sendEmailWithAutoResend(RESEND_API_KEY, sendPayload);
       await recordSentEmail(db, {
         resendId: result.id || null,
@@ -940,14 +1019,24 @@ export async function handleApiRequest(request, db, mailDomains, options = { res
         from: sendPayload.from,
         to: sendPayload.to,
         subject: sendPayload.subject,
-        html: sendPayload.html,
+        // 发件箱预览：把 cid 内嵌图还原成 data URI，前端无需公网即可显示图片
+        html: resolveCidAttachments(sendPayload.html, sendPayload.attachments),
         text: sendPayload.text,
         status: 'delivered',
         scheduledAt: sendPayload.scheduledAt || null,
         userId: uidForSend || null
       });
-      
-      logger.info({ logId, action: 'send_email', result: { sendId: result.id, status: 'delivered' } });
+
+      // 发送成功通知到默认 Telegram 群聊
+      if (result?.id) {
+        try {
+          await notifyTelegramSend(options.env, sendPayload, result.id, { baseUrl: url.origin });
+        } catch (tgErr) {
+          logger.warn({ logId, action: 'send_email', error: 'telegram_notify_failed', errorMessage: tgErr.message });
+        }
+      }
+
+      logger.info({ logId, action: 'send_email', result: { sendId: result.id, status: 'delivered', archivedTo: archiveForwardTo || '' } });
       return Response.json({ success: true, id: result.id });
     } catch (e) {
       logger.error({ logId, action: 'send_email', error: e.message, from: sendPayload?.from, to: sendPayload?.to });
@@ -1011,7 +1100,7 @@ export async function handleApiRequest(request, db, mailDomains, options = { res
             from: payload.from,
             to: payload.to,
             subject: payload.subject,
-            html: payload.html,
+            html: resolveCidAttachments(payload.html, payload.attachments),
             text: payload.text,
             status: 'delivered',
             scheduledAt: payload.scheduledAt || null,
@@ -1022,13 +1111,45 @@ export async function handleApiRequest(request, db, mailDomains, options = { res
       } catch (e) {
         logger.warn({ logId, action: 'send_batch', error: 'record_failed', recordedCount, errorMessage: e.message });
       }
-      
+
+      // 发送成功通知到默认 Telegram 群聊
+      try {
+        await notifyTelegramSend(options.env, items[0] || {}, Array.isArray(result) ? result[0]?.id || '' : '', { batchSize: items.length, baseUrl: url.origin });
+      } catch (tgErr) {
+        logger.warn({ logId, action: 'send_batch', error: 'telegram_notify_failed', errorMessage: tgErr.message });
+      }
+
       logger.info({ logId, action: 'send_batch', result: { batchSize: items.length, recordedCount, resultSize: Array.isArray(result) ? result.length : 0 } });
       return Response.json({ success: true, result });
     } catch (e) {
       logger.error({ logId, action: 'send_batch', error: e.message, batchSize: items?.length });
       return new Response('批量发送失败: ' + e.message, { status: 500 });
     }
+  }
+
+  // 查询归档转发邮箱配置（严格管理员）
+  if (path === '/api/config/forward' && request.method === 'GET') {
+    if (!isStrictAdmin()) {
+      return new Response('Unauthorized', { status: 403 });
+    }
+    const stored = await getAppConfig(db, 'ARCHIVE_FORWARD_TO');
+    const forwardTo = String((stored && stored.value) ? stored.value : '').trim()
+      || String(options.env?.ARCHIVE_FORWARD_TO || '').trim();
+    logger.info({ logId, action: 'get_config_forward', status: 200 });
+    return Response.json({ forwardTo });
+  }
+
+  // 更新归档转发邮箱配置（严格管理员，空值即关闭）
+  if (path === '/api/config/forward' && request.method === 'PUT') {
+    if (!isStrictAdmin()) {
+      return new Response('Unauthorized', { status: 403 });
+    }
+    let body;
+    try { body = await request.json(); } catch (e) { return new Response('Bad Request', { status: 400 }); }
+    const forwardTo = String(body.forwardTo || '').trim();
+    await setAppConfig(db, 'ARCHIVE_FORWARD_TO', forwardTo || '');
+    logger.info({ logId, action: 'update_config_forward', forwardTo: forwardTo || '(已关闭)', status: 200 });
+    return Response.json({ success: true, forwardTo });
   }
 
   // 查询发送结果
@@ -1421,14 +1542,14 @@ export async function handleApiRequest(request, db, mailDomains, options = { res
     const payload = getJwtPayload();
     let uid = Number(payload?.userId || 0);
     // 兼容旧会话：严格管理员旧 Token 可能没有 userId，这里兜底保障可置顶
+    // 优先归属到当前管理员（使 chuancey 等 role=admin 账号也能正确置顶），回退到 ADMIN_NAME
     if (!uid && isStrictAdmin()) {
       try {
-        const { results } = await db.prepare('SELECT id FROM users WHERE username = ?')
-          .bind(String(options?.adminName || 'admin').toLowerCase()).all();
+        const uname = String(getJwtPayload()?.username || options?.adminName || 'admin').toLowerCase();
+        const { results } = await db.prepare('SELECT id FROM users WHERE username = ?').bind(uname).all();
         if (results && results.length) {
           uid = Number(results[0].id);
         } else {
-          const uname = String(options?.adminName || 'admin').toLowerCase();
           await db.prepare('INSERT INTO users (username, role, can_send, mailbox_limit) VALUES (?, \'admin\', 1, 9999)').bind(uname).run();
           const again = await db.prepare('SELECT id FROM users WHERE username = ?').bind(uname).all();
           uid = Number(again?.results?.[0]?.id || 0);
@@ -1763,7 +1884,11 @@ export async function handleApiRequest(request, db, mailDomains, options = { res
               const parsed = parseEmailBody(eml);
               content = parsed.text || '';
               html_content = parsed.html || '';
-              
+              // 将内嵌图片（cid:）替换为 data URI，使富文本邮件中的图片可显示
+              if (html_content) {
+                html_content = resolveInlineImages(eml, html_content);
+              }
+
               // 如果 R2 中有内容，更新数据库中的预览
               if (content && !row.preview) {
                 const preview = String(content).substring(0, 120);
@@ -2002,6 +2127,7 @@ export async function handleEmailReceive(requestOrData, db, env) {
     const subject = String(emailData?.subject || '(无主题)');
     const text = String(emailData?.text || '');
     const html = String(emailData?.html || '');
+    const raw = String(emailData?.raw || '');
 
     const mailbox = extractEmail(to);
     const sender = extractEmail(from || envelopeFrom);
@@ -2071,7 +2197,12 @@ export async function handleEmailReceive(requestOrData, db, env) {
         const keyId = (crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`);
         const safeMailbox = (mailbox || 'unknown').toLowerCase().replace(/[^a-z0-9@._-]/g, '_');
         objectKey = `${y}/${m}/${d}/${safeMailbox}/${hh}${mm}${ss}-${keyId}.eml`;
-        await r2.put(objectKey, eml, { httpMetadata: { contentType: 'message/rfc822' } });
+        // 优先保存原始全量邮件（含内嵌图片/附件），保证详情可回放；否则回退到重建的 eml
+        let archiveBody = eml;
+        if (raw.trim() && /^[A-Za-z-]+:/m.test(raw)) {
+          archiveBody = raw;
+        }
+        await r2.put(objectKey, archiveBody, { httpMetadata: { contentType: 'message/rfc822' } });
       }
     } catch (err) { void err; objectKey = ''; }
 
@@ -2085,8 +2216,13 @@ export async function handleEmailReceive(requestOrData, db, env) {
         .replace(/<script[\s\S]*?<\/script>/gi, ' ');
       previewBaseRaw = safeHtml.replace(/<[^>]+>/g, ' ');
     }
-    const previewBase = String(previewBaseRaw || '').replace(/\s+/g, ' ').trim();
-    const preview = String(previewBase || '').slice(0, 120);
+    const previewBase = String(previewBaseRaw || '')
+      // 剔除 Gmail 等对内嵌图片的占位符 "[image: xxx]"，图片已另行发送
+      .replace(/\[image:[^\]]*\]/gi, ' ')
+      .replace(/\s+/g, ' ').trim();
+    // 纯图片/富文本但无可提取文字时，给出中性占位，避免 Telegram 显示空或残留文件名
+    const effectivePreview = previewBase || (/(<img\b)/i.test(html) ? '📎 含图片' : (html ? '📧 富文本内容' : ''));
+    const preview = String(effectivePreview || '').slice(0, 120);
     let verificationCode = '';
     let loginLink = '';
     try {
@@ -2121,23 +2257,32 @@ export async function handleEmailReceive(requestOrData, db, env) {
     } catch (err) { void err; }
 
     try {
-      let targetChatIds = [];
+      // 收集需要通知的 Telegram Chat：绑定该邮箱的用户 + 配置的默认接收 Chat
+      // 默认 Chat 始终加入，确保即使邮箱未绑定 Telegram 用户也能收到通知
+      const targetChatIds = [];
+      const seen = new Set();
       try {
         const { results } = await db.prepare(
           'SELECT u.telegram_chat_id FROM users u JOIN user_mailboxes um ON um.user_id = u.id JOIN mailboxes m ON m.id = um.mailbox_id WHERE m.id = ? AND u.telegram_chat_id IS NOT NULL'
         ).bind(mailboxId).all();
-        targetChatIds = (results || []).map(function(row) { return String(row.telegram_chat_id); });
+        (results || []).forEach(function(row) {
+          const cid = String(row.telegram_chat_id || '').trim();
+          if (cid && !seen.has(cid)) { seen.add(cid); targetChatIds.push(cid); }
+        });
       } catch (e) {
         logger.error('查询用户 Telegram 绑定失败', e);
       }
 
-      if (!targetChatIds.length && env.TELEGRAM_CHAT_ID) {
-        targetChatIds = [String(env.TELEGRAM_CHAT_ID)];
+      const defaultChat = String(env.TELEGRAM_CHAT_ID || '').trim();
+      if (defaultChat && !seen.has(defaultChat)) {
+        seen.add(defaultChat);
+        targetChatIds.push(defaultChat);
       }
 
-      if (env.TELEGRAM_BOT_TOKEN && targetChatIds.length) {
-        const previewText = String(previewBase || '').slice(0, 200);
-        const shouldEllipsis = String(previewBase || '').length > previewText.length;
+      const botToken = String(env.TELEGRAM_BOT_TOKEN || '').trim();
+      if (botToken && targetChatIds.length) {
+        const previewText = String(effectivePreview || '').slice(0, 200);
+        const shouldEllipsis = String(effectivePreview || '').length > previewText.length;
         const verificationCodeStr = String(verificationCode || '');
         const isVerificationCodeLink = /^https?:\/\//i.test(verificationCodeStr);
         let verificationBlock = '';
@@ -2158,9 +2303,19 @@ export async function handleEmailReceive(requestOrData, db, env) {
           (loginLink ? '<b>🔗 登录链接:</b> <a href="' + escapeHtml(loginLink) + '">点击登录</a>\n' : '') +
           '\n' + escapeHtml(previewText) + (shouldEllipsis ? '...' : '');
 
+        // 若邮件含内嵌图片，则以图片方式发送（caption 为通知文本，支持 HTML 富文本），Telegram 才能显示图片
+        // 多张图片用媒体组（相册）一次发送，避免只显示第一张
+        const inlineImages = raw ? extractInlineImages(raw) : [];
         for (const cid of targetChatIds) {
+          const chatEnv = { TELEGRAM_BOT_TOKEN: botToken, TELEGRAM_CHAT_ID: cid };
           try {
-            await sendTelegramMessage({ TELEGRAM_BOT_TOKEN: env.TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID: cid }, baseMsg);
+            if (inlineImages.length > 1) {
+              await sendTelegramMediaGroup(chatEnv, baseMsg, inlineImages);
+            } else if (inlineImages.length === 1) {
+              await sendTelegramPhoto(chatEnv, baseMsg, inlineImages[0].data, inlineImages[0].mimeType);
+            } else {
+              await sendTelegramMessage(chatEnv, baseMsg);
+            }
           } catch (e) {
             logger.error('Telegram notification failed', e);
           }
@@ -2175,4 +2330,155 @@ export async function handleEmailReceive(requestOrData, db, env) {
     logger.error('处理邮件时出错', error);
     return new Response('处理邮件失败', { status: 500 });
   }
+}
+
+/**
+ * 解析归档转发目标：优先取 D1 配置表，其次回退 env.ARCHIVE_FORWARD_TO
+ */
+async function resolveArchiveForwardTo(db, env) {
+  try {
+    const stored = await getAppConfig(db, 'ARCHIVE_FORWARD_TO');
+    if (stored && stored.value) {
+      const v = String(stored.value).trim();
+      if (v) { return v; }
+    }
+  } catch (e) { void e; }
+  return String((env && env.ARCHIVE_FORWARD_TO) || '').trim() || null;
+}
+
+/**
+ * 判断归档目标是否已出现在 to/cc/bcc 中，避免重复投递副本
+ */
+function isRecipientListed(payload, target) {
+  if (!target) { return true; }
+  const t = String(target).trim().toLowerCase();
+  const list = [payload.to, payload.cc, payload.bcc].flat().filter(Boolean);
+  return list.some(item => String(item).trim().toLowerCase() === t);
+}
+
+/**
+ * 将 base64 字符串解码为 Uint8Array（同时兼容多行/带 data: 前缀的 base64）
+ * @param {string} b64 可能是纯 base64，也可能带 "data:image/png;base64," 前缀
+ */
+function base64DataToBytes(b64) {
+  try {
+    const cleaned = String(b64)
+      .replace(/^data:[^,]+;base64,/i, '')
+      .replace(/\s+/g, '');
+    const bin = atob(cleaned);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) { out[i] = bin.charCodeAt(i); }
+    return out;
+  } catch (e) {
+    void e;
+    return null;
+  }
+}
+
+/**
+ * 依据文件名后缀猜测 MIME 类型，用于 Telegram sendPhoto。
+ * @param {string} filename
+ * @returns {string} 如 image/png、image/jpeg、image/gif、image/webp
+ */
+function mimeFromFilename(filename) {
+  const ext = String(filename || '').split('.').pop().toLowerCase();
+  const map = {
+    png: 'image/png',
+    jpg: 'image/jpeg',
+    jpeg: 'image/jpeg',
+    gif: 'image/gif',
+    webp: 'image/webp',
+    bmp: 'image/bmp'
+  };
+  return map[ext] || 'image/png';
+}
+
+/**
+ * 将内嵌图片写入 R2，返回公网 URL（供 Telegram 链接预览抓取）
+ * @param {object} env 环境变量（含 MAIL_EML R2 绑定）
+ * @param {Uint8Array} bytes 图片字节
+ * @param {string} mimeType 图片 MIME 类型
+ * @param {string} baseUrl Worker 公网源（如 https://tmp-mail.214599.xyz）
+ * @returns {Promise<string|null>} 公网 URL，失败返回 null
+ */
+async function storeInlineImageToR2(env, bytes, mimeType, baseUrl) {
+  try {
+    const r2 = env && env.MAIL_EML;
+    if (!r2 || !baseUrl || !bytes || !bytes.length) { return null; }
+    const ext = String(mimeType || 'image/png').split('/')[1] || 'png';
+    const keyId = (crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    const objectKey = `media/inline-${keyId}.${ext}`;
+    await r2.put(objectKey, bytes, { httpMetadata: { contentType: mimeType || 'image/png' } });
+    return `${String(baseUrl).replace(/\/+$/, '')}/media/${objectKey.slice('media/'.length)}`;
+  } catch (e) {
+    logger.warn('内嵌图片写 R2 失败，回退 sendPhoto', e);
+    return null;
+  }
+}
+
+/**
+ * 发送成功后推送 "📤 已发送" 摘要到默认 Telegram 群聊
+ * @param {object} env 环境变量（含 TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID / MAIL_EML）
+ * @param {object} payload 发送载荷（from/subject/to/text/html/attachments）
+ * @param {string} sendId Resend 返回的发送 ID
+ * @param {object} extra 附加信息（如 batchSize、baseUrl）
+ */
+async function notifyTelegramSend(env, payload, sendId, extra = {}) {
+  const token = String((env && env.TELEGRAM_BOT_TOKEN) || '').trim();
+  const chatId = String((env && env.TELEGRAM_CHAT_ID) || '').trim();
+  if (!token || !chatId) { return; }
+  const from = String(payload.from || '').trim().toLowerCase();
+  const to = String(payload.to || '').trim();
+  const subject = String(payload.subject || '').trim();
+  let text = '<b>📤 已发送</b>';
+  if (extra.batchSize) { text += `（批量 ${extra.batchSize} 封）`; }
+  text += '\n';
+  if (from) { text += `发件人：<code>${escapeHtml(from)}</code>\n`; }
+  if (to) { text += `收件人：<code>${escapeHtml(to)}</code>\n`; }
+  if (subject) { text += `主题：${escapeHtml(subject)}\n`; }
+  text += `ID：<code>${encodeURIComponent(sendId || '')}</code>`;
+  // 附加正文本内容（纯文本优先，其次从 HTML 剥离标签），让 Bot 里也能看到正文
+  let bodyText = String(payload.text || '').trim();
+  if (!bodyText) {
+    bodyText = String(payload.html || '')
+      .replace(/<br\s*\/?>|<\/p>|<\/div>|<\/tr>|<\/li>/gi, '\n')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+  if (bodyText) {
+    // sendMessage 上限 4096，正文最多截 3000，确保正文完整不被 caption 的 1024 限制吞掉
+    text += '\n\n<b>📄 正文:</b>\n' + escapeHtml(bodyText.substring(0, 3000));
+  }
+  const attachList = Array.isArray(payload.attachments) ? payload.attachments : [];
+  const inlineImgs = attachList.filter(a => a && (((a.disposition && String(a.disposition).toLowerCase()) !== 'attachment') || a.content_id) && String(a.filename || '').match(/\.(png|jpe?g|gif|webp|bmp)$/i));
+  if (inlineImgs.length) {
+    // 每张内嵌图都写入 R2 并附上独立的可点击链接（Telegram 只对整条消息里的第一个 URL 生成预览缩略图）
+    const links = [];
+    const fallbackPhotos = [];
+    for (let i = 0; i < inlineImgs.length; i++) {
+      const img = inlineImgs[i];
+      const bytes = (img && img.content) ? base64DataToBytes(String(img.content)) : null;
+      if (!bytes || !bytes.length) { continue; }
+      const mime = mimeFromFilename(img.filename);
+      const imgUrl = await storeInlineImageToR2(env, bytes, mime, extra.baseUrl);
+      if (imgUrl) {
+        links.push(`🖼 图片${i + 1}：<a href="${imgUrl}">查看</a>`);
+      } else {
+        fallbackPhotos.push({ bytes, mime });
+      }
+    }
+    if (links.length) {
+      text += '\n\n' + links.join('\n');
+      await sendTelegramMessage(env, text, 'HTML', { disableWebPagePreview: false });
+    } else {
+      await sendTelegramMessage(env, text, 'HTML');
+    }
+    // R2 写失败的图用 sendPhoto 兜底，确保不丢图
+    for (const p of fallbackPhotos) {
+      await sendTelegramPhoto(env, '<b>📎 内嵌图片</b>', p.bytes, p.mime);
+    }
+    return;
+  }
+  await sendTelegramMessage(env, text, 'HTML');
 }
