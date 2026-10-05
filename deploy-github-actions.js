@@ -135,11 +135,13 @@ try {
   ];
 
   for (const envVar of envVars) {
-    const hasKey = Object.prototype.hasOwnProperty.call(process.env, envVar.name);
-    if (hasKey) {
+    const raw = Object.prototype.hasOwnProperty.call(process.env, envVar.name) ? process.env[envVar.name] : undefined;
+    // 去除首尾空白：避免换行符导致密码/Token 校验失败
+    const value = String(raw ?? '').trim();
+    if (value) {
       try {
         execSync(`npx wrangler secret put ${envVar.name} --env=""`, {
-          input: String(envVar.value ?? ''),
+          input: value,
           stdio: ['pipe', 'inherit', 'inherit']
         });
         console.log(`✅ 已同步环境变量: ${envVar.name}`);
@@ -147,15 +149,9 @@ try {
         console.warn(`⚠️ 同步环境变量 ${envVar.name} 失败:`, error.message);
       }
     } else {
-      try {
-        execSync(`npx wrangler secret delete ${envVar.name} --env=""`, {
-          input: 'y\n',
-          stdio: ['pipe', 'inherit', 'inherit']
-        });
-        console.log(`🗑️ 已删除 Cloudflare 中多余的环境变量: ${envVar.name}`);
-      } catch {
-        console.log(`ℹ️ Cloudflare 中不存在需删除的环境变量: ${envVar.name}`);
-      }
+      // 值为空时跳过，避免把仓库中未配置的 Secret（GitHub 会注入为空串）刷成空，
+      // 导致管理员登录、Telegram 通知等功能失效。如需删除请手动执行删除。
+      console.log(`⏭️ 跳过空的环境变量: ${envVar.name}（保留 Cloudflare 中已有值；如需删除请手动运行 npx wrangler secret delete ${envVar.name} --env=""）`);
     }
   }
 
